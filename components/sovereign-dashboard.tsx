@@ -347,6 +347,69 @@ function isValidWebsiteInput(value: string): boolean {
   }
 }
 
+function websiteHostname(value: string): string | null {
+  try {
+    const url = new URL(
+      /^https?:\/\//i.test(value.trim())
+        ? value.trim()
+        : `https://${value.trim()}`,
+    );
+    return url.hostname.toLowerCase().replace(/^www\./, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+function removeBenchmarkTerm(value: string, term: string): string {
+  const trimmedTerm = term.trim();
+  if (!trimmedTerm) return value;
+
+  const escaped = trimmedTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `(^|[^\\p{L}\\p{N}])${escaped}(?=$|[^\\p{L}\\p{N}])`,
+    "giu",
+  );
+  return value.replace(pattern, "$1");
+}
+
+function createGeoRankBenchmarkPrompts(
+  industry: string,
+  country: string,
+  forbiddenTerms: string[],
+): string[] {
+  const sanitize = (value: string, fallback: string) => {
+    const sanitized = forbiddenTerms
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .reduce(removeBenchmarkTerm, value)
+      .replace(/\s+/g, " ")
+      .trim();
+    return sanitized || fallback;
+  };
+
+  const safeIndustry = sanitize(industry, "service provider");
+  const safeCountry = sanitize(country, "the selected market");
+  const prompts = [
+    `What are the best ${safeIndustry} options in ${safeCountry}?`,
+    `Which ${safeIndustry} providers are most recommended in ${safeCountry}?`,
+    `What are reputable ${safeIndustry} businesses in ${safeCountry}? Include sources.`,
+    `Which ${safeIndustry} companies are frequently recommended by experts?`,
+    `What are the leading ${safeIndustry} brands in ${safeCountry}?`,
+    `Which ${safeIndustry} providers have strong customer reputations?`,
+    `What are trusted ${safeIndustry} options in ${safeCountry}?`,
+    `Compare the leading ${safeIndustry} providers in ${safeCountry}.`,
+    `Which ${safeIndustry} businesses are worth considering in ${safeCountry}?`,
+    `What ${safeIndustry} providers are commonly cited by reliable sources?`,
+  ];
+
+  return prompts.map((prompt) =>
+    sanitize(prompt, "What service providers are recommended? Include sources.")
+      .replace(/\s+([?.!,])/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
 function createAnswerPreview(answer: string, maxLength = 140): string {
   const plainText = answer.replace(/\s+/g, " ").trim();
   return plainText.length > maxLength
@@ -1281,14 +1344,17 @@ export function SovereignDashboard({
   async function callScrape(
     prompt: string,
     analysisId?: string,
+    progressMessage?: string,
   ): Promise<boolean> {
     const providers =
       state.activeProviders.length > 0
         ? state.activeProviders
         : [state.provider];
     const count = providers.length;
-    setBusy(true);
-    setMessage(`Running across ${count} model${count > 1 ? "s" : ""}...`);
+    setMessage(
+      progressMessage ??
+        `Running across ${count} model${count > 1 ? "s" : ""}...`,
+    );
 
     try {
       const results = await Promise.allSettled(
@@ -1319,8 +1385,6 @@ export function SovereignDashboard({
     } catch {
       setMessage("Analysis request failed. Please try again.");
       return false;
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -1372,12 +1436,44 @@ export function SovereignDashboard({
     }
 
     setAnalysisError("");
-    const prompt = `For users in ${country}, what are the leading ${industry} brands or services, and how does ${brandName} (${website}) compare? Include sources.`;
     const analysisId = crypto.randomUUID();
-    const completed = await callScrape(prompt, analysisId);
+    const domain = websiteHostname(website);
+    const competitorTerms = [
+      ...state.competitors.flatMap((competitor) => [
+        competitor.name,
+        ...competitor.aliases,
+      ]),
+      ...normalizeCompetitorNames(competitorDraft, brandName),
+    ];
+    const benchmarkPrompts = createGeoRankBenchmarkPrompts(industry, country, [
+      brandName,
+      website,
+      domain ?? "",
+      domain ? `www.${domain}` : "",
+      ...competitorTerms,
+    ]);
 
-    if (completed) {
+    setBusy(true);
+    let completedBenchmarks = 0;
+
+    try {
+      for (const [index, prompt] of benchmarkPrompts.entries()) {
+        const completed = await callScrape(
+          prompt,
+          analysisId,
+          `Analyzing benchmark ${index + 1} of ${benchmarkPrompts.length}…`,
+        );
+        if (completed) completedBenchmarks += 1;
+      }
+    } finally {
+      setBusy(false);
+    }
+
+    if (completedBenchmarks > 0) {
       setSelectedAnalysisId(null);
+      setMessage(
+        `Analysis complete: ${completedBenchmarks} of ${benchmarkPrompts.length} benchmarks returned responses.`,
+      );
     } else {
       setAnalysisError(
         "GEO Rank analysis failed. Check the existing provider configuration and try again.",
@@ -2407,6 +2503,11 @@ ${exampleJson}`,
                         >
                           Back to Latest
                         </button>
+                      )}
+                      {geoRank.completedRuns < 10 && (
+                        <span className="rounded-full bg-th-card-alt px-2 py-1 text-xs font-medium text-th-text-muted">
+                          Preliminary score — limited sample
+                        </span>
                       )}
                     </div>
                     <button
