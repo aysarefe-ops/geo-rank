@@ -69,6 +69,7 @@ import {
   PROVIDER_LABELS,
   SCHEDULE_OPTIONS,
   COUNTRIES,
+  normalizeCountryCode,
 } from "@/components/dashboard/types";
 
 /* ── Inline SVG icon helpers (16×16) ─────────────────────────────── */
@@ -531,6 +532,10 @@ export function SovereignDashboard({
         if (merged.activeProviders.length === 0) {
           merged.activeProviders = [merged.provider];
         }
+        merged.country = normalizeCountryCode(
+          data.country,
+          defaultState.country,
+        );
         setState(merged);
         // Load complete — saves for this workspace are now safe.
         hydratedRef.current = true;
@@ -1325,7 +1330,7 @@ export function SovereignDashboard({
     const website = state.brand.websites[0]?.trim() ?? "";
     const brandName = state.brand.brandName.trim();
     const industry = state.brand.industry.trim();
-    const countryCode = state.country.trim();
+    const countryCode = normalizeCountryCode(state.country, "");
     const fieldErrors: AnalysisFieldErrors = {};
 
     if (!website) {

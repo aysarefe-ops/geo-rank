@@ -96,26 +96,107 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
   google_ai: "Google AI",
 };
 
-/** Countries available for geo-scoped AI-visibility tracking (Bright Data geolocation, 2-letter codes) */
-export const COUNTRIES: { code: string; label: string }[] = [
-  { code: "US", label: "United States" },
-  { code: "GB", label: "United Kingdom" },
-  { code: "CA", label: "Canada" },
-  { code: "AU", label: "Australia" },
-  { code: "DE", label: "Germany" },
-  { code: "FR", label: "France" },
-  { code: "ES", label: "Spain" },
-  { code: "IT", label: "Italy" },
-  { code: "NL", label: "Netherlands" },
-  { code: "BR", label: "Brazil" },
-  { code: "IN", label: "India" },
-  { code: "JP", label: "Japan" },
-  { code: "MX", label: "Mexico" },
-];
+/** Complete ISO 3166-1 alpha-2 country/territory codes. */
+const ISO_ALPHA_2_CODES = [
+  "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
+  "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS", "BT", "BV", "BW", "BY", "BZ",
+  "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN", "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ",
+  "DE", "DJ", "DK", "DM", "DO", "DZ",
+  "EC", "EE", "EG", "EH", "ER", "ES", "ET",
+  "FI", "FJ", "FK", "FM", "FO", "FR",
+  "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY",
+  "HK", "HM", "HN", "HR", "HT", "HU",
+  "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT",
+  "JE", "JM", "JO", "JP",
+  "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ",
+  "LA", "LB", "LC", "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY",
+  "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ",
+  "NA", "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ",
+  "OM",
+  "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY",
+  "QA",
+  "RE", "RO", "RS", "RU", "RW",
+  "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ",
+  "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ",
+  "UA", "UG", "UM", "US", "UY", "UZ",
+  "VA", "VC", "VE", "VG", "VI", "VN", "VU",
+  "WF", "WS",
+  "YE", "YT",
+  "ZA", "ZM", "ZW",
+] as const;
+
+const countryDisplayNames = new Intl.DisplayNames(["en"], { type: "region" });
+
+/** Countries available for geo-scoped AI-visibility tracking. */
+export const COUNTRIES: { code: string; label: string }[] =
+  ISO_ALPHA_2_CODES.map((code) => ({
+    code,
+    label:
+      code === "TR" ? "Türkiye" : (countryDisplayNames.of(code) ?? code),
+  })).sort((a, b) => a.label.localeCompare(b.label, "en"));
 
 export const COUNTRY_LABELS: Record<string, string> = Object.fromEntries(
   COUNTRIES.map((c) => [c.code, c.label]),
 );
+
+function normalizeCountryLookup(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+const LEGACY_COUNTRY_ALIASES: Record<string, string> = {
+  england: "GB",
+  "great britain": "GB",
+  uk: "GB",
+  "united states of america": "US",
+  usa: "US",
+  turkey: "TR",
+  turkiye: "TR",
+  "czech republic": "CZ",
+  "cape verde": "CV",
+  swaziland: "SZ",
+  macedonia: "MK",
+  russia: "RU",
+  vietnam: "VN",
+  "viet nam": "VN",
+  bolivia: "BO",
+  brunei: "BN",
+  iran: "IR",
+  laos: "LA",
+  moldova: "MD",
+  palestine: "PS",
+  syria: "SY",
+  tanzania: "TZ",
+  venezuela: "VE",
+};
+
+const COUNTRY_CODES_BY_NAME = new Map<string, string>([
+  ...COUNTRIES.map(
+    ({ code, label }) => [normalizeCountryLookup(label), code] as const,
+  ),
+  ...Object.entries(LEGACY_COUNTRY_ALIASES),
+]);
+
+/** Convert saved ISO codes or legacy country names into an ISO alpha-2 code. */
+export function normalizeCountryCode(
+  value: unknown,
+  fallback = "US",
+): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+
+  const upperCode = trimmed.toUpperCase();
+  if (Object.prototype.hasOwnProperty.call(COUNTRY_LABELS, upperCode)) {
+    return upperCode;
+  }
+
+  return COUNTRY_CODES_BY_NAME.get(normalizeCountryLookup(trimmed)) ?? fallback;
+}
 
 /** A drift alert generated when visibility changes significantly between auto-runs */
 export type DriftAlert = {
