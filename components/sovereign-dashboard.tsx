@@ -9,11 +9,36 @@ import {
   type ReactNode,
 } from "react";
 import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
   loadSovereignValue,
   saveSovereignValue,
   clearSovereignStore,
 } from "@/lib/client/sovereign-store";
 import { DEMO_STATE } from "@/lib/demo-data";
+import {
+  calculateGeoRankScore,
+  isCompletedGeoRankRun,
+  runCitesTargetWebsite,
+} from "@/lib/geo-rank-score";
+import {
+  calculateAiShareOfVoice,
+  createTrackedBrands,
+  detectTrackedBrands,
+  normalizeCompetitorNames,
+} from "@/lib/brand-share-of-voice";
+import {
+  compareLatestAnalysisBatches,
+  selectAnalysisRuns,
+  summarizeAnalysisBatches,
+} from "@/lib/analysis-batches";
 import { AeoAuditTab } from "@/components/dashboard/tabs/aeo-audit-tab";
 import { AutomationTab } from "@/components/dashboard/tabs/automation-tab-v2";
 import { BattlecardsTab } from "@/components/dashboard/tabs/battlecards-tab";
@@ -44,7 +69,6 @@ import {
   PROVIDER_LABELS,
   SCHEDULE_OPTIONS,
   COUNTRIES,
-  tabs,
 } from "@/components/dashboard/types";
 
 /* ── Inline SVG icon helpers (16×16) ─────────────────────────────── */
@@ -254,8 +278,8 @@ const tabMeta: Record<
       "Browse all collected AI responses. Brand and competitor mentions are highlighted in-context. View visibility scores, sentiment, and cited sources per response.",
   },
   "Visibility Analytics": {
-    title: "Analytics",
-    tooltip: "Track visibility score and sentiment trends over time.",
+    title: "Dashboard",
+    tooltip: "View your GEO Rank score and visibility metrics.",
     details:
       "Monitor your brand visibility score over time, track sentiment distribution across responses, and export data as CSV for further analysis.",
   },
@@ -291,15 +315,67 @@ const tabMeta: Record<
   },
 };
 
+const visibleTabs = ["Visibility Analytics", "Project Settings"] as const;
+
+type QueryVisibilityFilter =
+  | "all"
+  | "mentioned"
+  | "not-mentioned"
+  | "cited"
+  | "not-cited";
+
+type AnalysisField = "website" | "brand" | "industry" | "country";
+type AnalysisFieldErrors = Partial<Record<AnalysisField, string>>;
+
+function isValidWebsiteInput(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+
+  try {
+    const url = new URL(
+      /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`,
+    );
+    const hostnameParts = url.hostname.replace(/\.$/, "").split(".");
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      hostnameParts.length >= 2 &&
+      hostnameParts.every(Boolean)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function createAnswerPreview(answer: string, maxLength = 140): string {
+  const plainText = answer.replace(/\s+/g, " ").trim();
+  return plainText.length > maxLength
+    ? `${plainText.slice(0, maxLength - 1).trimEnd()}…`
+    : plainText;
+}
+
+function formatAnalysisDate(timestamp: string | null): string {
+  if (!timestamp) return "Unknown date";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "Unknown date";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(date);
+}
+
 export function SovereignDashboard({
   demoMode = false,
-  demoReason = "explicit",
 }: { demoMode?: boolean; demoReason?: "explicit" | "no-key" } = {}) {
   const [activeTab, setActiveTab] = useState<TabKey>("Visibility Analytics");
   const [state, setState] = useState<AppState>(
     demoMode ? DEMO_STATE : defaultState,
   );
   const [busy, setBusy] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const [analysisFieldErrors, setAnalysisFieldErrors] =
+    useState<AnalysisFieldErrors>({});
   const [message, setMessage] = useState(
     demoMode ? "Demo mode — read-only preview" : "",
   );
@@ -309,6 +385,20 @@ export function SovereignDashboard({
   const [showWsPicker, setShowWsPicker] = useState(false);
   const [showScoreInfo, setShowScoreInfo] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [selectedAnalysisId, setSelectedAnalysisId] = useState<string | null>(
+    null,
+  );
+  const [queryProviderFilter, setQueryProviderFilter] = useState<
+    Provider | "all"
+  >("all");
+  const [queryVisibilityFilter, setQueryVisibilityFilter] =
+    useState<QueryVisibilityFilter>("all");
+  const [competitorDraft, setCompetitorDraft] = useState(() =>
+    (demoMode ? DEMO_STATE.competitors : defaultState.competitors)
+      .map((competitor) => competitor.name)
+      .join(", "),
+  );
+  const [competitorFieldFocused, setCompetitorFieldFocused] = useState(false);
   /**
    * False until the active workspace's state has finished loading from
    * IDB/cloud. Guards the save effect so the initial `defaultState` never
@@ -484,7 +574,11 @@ export function SovereignDashboard({
 
   /** ref to latest callScrapeOne so the scheduler callback doesn't use stale brand terms */
   const callScrapeOneRef = useRef<
-    (prompt: string, provider: Provider) => Promise<ScrapeRun | null>
+    (
+      prompt: string,
+      provider: Provider,
+      analysisId?: string,
+    ) => Promise<ScrapeRun | null>
   >(
     // placeholder — will be assigned after callScrapeOne is defined
     async () => null,
@@ -736,9 +830,152 @@ export function SovereignDashboard({
       .sort((a, b) => a.day.localeCompare(b.day));
   }, [state.runs]);
 
-  const totalSources = useMemo(
-    () => state.runs.reduce((acc, run) => acc + run.sources.length, 0),
-    [state.runs],
+  const currentAnalysis = useMemo(
+    () => selectAnalysisRuns(state.runs, selectedAnalysisId),
+    [state.runs, selectedAnalysisId],
+  );
+
+  const analysisHistory = useMemo(
+    () => summarizeAnalysisBatches(state.runs, state.brand.websites),
+    [state.runs, state.brand.websites],
+  );
+
+  const validAnalysisHistory = useMemo(
+    () =>
+      analysisHistory.filter(
+        (analysis) =>
+          analysis.completedResponses > 0 && analysis.timestamp !== null,
+      ),
+    [analysisHistory],
+  );
+
+  const historyChartData = useMemo(
+    () =>
+      [...validAnalysisHistory]
+        .reverse()
+        .map((analysis) => ({
+          date: formatAnalysisDate(analysis.timestamp),
+          score: analysis.score,
+        })),
+    [validAnalysisHistory],
+  );
+
+  const currentHistory = validAnalysisHistory[0] ?? null;
+  const previousHistory = validAnalysisHistory[1] ?? null;
+  const selectedHistory = selectedAnalysisId
+    ? (validAnalysisHistory.find(
+        (analysis) => analysis.analysisId === selectedAnalysisId,
+      ) ?? null)
+    : null;
+  const viewingHistoricalAnalysis =
+    selectedHistory !== null &&
+    selectedHistory.analysisId !== currentHistory?.analysisId;
+  const historyChange =
+    currentHistory && previousHistory
+      ? currentHistory.score - previousHistory.score
+      : null;
+  const completedAnalysisCount = validAnalysisHistory.length;
+  const hasCompletedRealAnalysis =
+    !demoMode && state.runs.some(isCompletedGeoRankRun);
+  const latestComparison = useMemo(
+    () => compareLatestAnalysisBatches(analysisHistory),
+    [analysisHistory],
+  );
+
+  const geoRank = useMemo(
+    () =>
+      calculateGeoRankScore(currentAnalysis.runs, {
+        targetWebsites: state.brand.websites,
+      }),
+    [currentAnalysis.runs, state.brand.websites],
+  );
+
+  useEffect(() => {
+    if (!competitorFieldFocused) {
+      setCompetitorDraft(
+        state.competitors.map((competitor) => competitor.name).join(", "),
+      );
+    }
+  }, [state.competitors, competitorFieldFocused]);
+
+  const trackedBrands = useMemo(
+    () =>
+      createTrackedBrands(
+        state.brand.brandName,
+        normalizeCompetitorNames(competitorDraft, state.brand.brandName),
+      ),
+    [state.brand.brandName, competitorDraft],
+  );
+
+  const shareOfVoice = useMemo(
+    () => calculateAiShareOfVoice(currentAnalysis.runs, trackedBrands),
+    [currentAnalysis.runs, trackedBrands],
+  );
+
+  const queryResults = useMemo(
+    () =>
+      currentAnalysis.runs
+        .filter(isCompletedGeoRankRun)
+        .map((run) => ({
+          run,
+          mentioned: (run.brandMentions?.length ?? 0) > 0,
+          cited: runCitesTargetWebsite(run, state.brand.websites),
+          brandsFound: detectTrackedBrands(run.answer, trackedBrands),
+        }))
+        .sort((a, b) => {
+          const aTime = Date.parse(a.run.createdAt);
+          const bTime = Date.parse(b.run.createdAt);
+          return (Number.isNaN(bTime) ? 0 : bTime) -
+            (Number.isNaN(aTime) ? 0 : aTime);
+        }),
+    [currentAnalysis.runs, state.brand.websites, trackedBrands],
+  );
+
+  const queryResultProviders = useMemo(
+    () =>
+      [...new Set(queryResults.map(({ run }) => run.provider))].sort((a, b) =>
+        PROVIDER_LABELS[a].localeCompare(PROVIDER_LABELS[b]),
+      ),
+    [queryResults],
+  );
+
+  useEffect(() => {
+    if (
+      selectedAnalysisId &&
+      !validAnalysisHistory.some(
+        (analysis) => analysis.analysisId === selectedAnalysisId,
+      )
+    ) {
+      setSelectedAnalysisId(null);
+    }
+  }, [validAnalysisHistory, selectedAnalysisId]);
+
+  useEffect(() => {
+    if (
+      queryProviderFilter !== "all" &&
+      !queryResultProviders.includes(queryProviderFilter)
+    ) {
+      setQueryProviderFilter("all");
+    }
+  }, [queryProviderFilter, queryResultProviders]);
+
+  const filteredQueryResults = useMemo(
+    () =>
+      queryResults.filter(({ run, mentioned, cited }) => {
+        if (
+          queryProviderFilter !== "all" &&
+          run.provider !== queryProviderFilter
+        ) {
+          return false;
+        }
+
+        if (queryVisibilityFilter === "mentioned") return mentioned;
+        if (queryVisibilityFilter === "not-mentioned") return !mentioned;
+        if (queryVisibilityFilter === "cited") return cited;
+        if (queryVisibilityFilter === "not-cited") return !cited;
+        return true;
+      }),
+    [queryResults, queryProviderFilter, queryVisibilityFilter],
   );
 
   /** Count unique domains cited in runs where the brand was NOT mentioned — these are outreach targets */
@@ -984,6 +1221,7 @@ export function SovereignDashboard({
   async function callScrapeOne(
     prompt: string,
     provider: Provider,
+    analysisId?: string,
   ): Promise<ScrapeRun | null> {
     if (demoMode) {
       setMessage("Demo mode — API calls are disabled");
@@ -1010,6 +1248,7 @@ export function SovereignDashboard({
       const competitorTerms = getCompetitorTerms();
 
       return {
+        ...(analysisId ? { analysisId } : {}),
         provider: data.provider,
         prompt: data.prompt,
         answer: answerText,
@@ -1034,7 +1273,10 @@ export function SovereignDashboard({
   callScrapeOneRef.current = callScrapeOne;
 
   /** Run a prompt across all activeProviders in parallel */
-  async function callScrape(prompt: string) {
+  async function callScrape(
+    prompt: string,
+    analysisId?: string,
+  ): Promise<boolean> {
     const providers =
       state.activeProviders.length > 0
         ? state.activeProviders
@@ -1045,7 +1287,7 @@ export function SovereignDashboard({
 
     try {
       const results = await Promise.allSettled(
-        providers.map((p) => callScrapeOne(prompt, p)),
+        providers.map((p) => callScrapeOne(prompt, p, analysisId)),
       );
 
       const runs: ScrapeRun[] = results
@@ -1056,7 +1298,7 @@ export function SovereignDashboard({
         setMessage(
           "All scrape requests failed. Check your Bright Data config.",
         );
-        return;
+        return false;
       }
 
       setState((prev) => ({
@@ -1068,13 +1310,100 @@ export function SovereignDashboard({
       setMessage(
         `Done: ${runs.length}/${count} model${count > 1 ? "s" : ""} returned results.${failed > 0 ? ` ${failed} failed.` : ""}`,
       );
-    } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : "Failed to run scraper.",
-      );
+      return true;
+    } catch {
+      setMessage("Analysis request failed. Please try again.");
+      return false;
     } finally {
       setBusy(false);
     }
+  }
+
+  async function analyzeGeoRank() {
+    if (busy) return;
+
+    const website = state.brand.websites[0]?.trim() ?? "";
+    const brandName = state.brand.brandName.trim();
+    const industry = state.brand.industry.trim();
+    const countryCode = state.country.trim();
+    const fieldErrors: AnalysisFieldErrors = {};
+
+    if (!website) {
+      fieldErrors.website = "Website is required.";
+    } else if (!isValidWebsiteInput(website)) {
+      fieldErrors.website = "Enter a valid website such as example.com.";
+    }
+    if (!brandName) fieldErrors.brand = "Brand is required.";
+    if (!industry) fieldErrors.industry = "Industry is required.";
+    if (!countryCode) fieldErrors.country = "Country is required.";
+
+    if (Object.keys(fieldErrors).length > 0) {
+      setAnalysisFieldErrors(fieldErrors);
+      setAnalysisError("");
+      return;
+    }
+
+    setAnalysisFieldErrors({});
+    setState((prev) => ({
+      ...prev,
+      country: countryCode,
+      brand: {
+        ...prev.brand,
+        brandName,
+        industry,
+        websites: [website, ...prev.brand.websites.slice(1)],
+      },
+    }));
+
+    const country =
+      COUNTRIES.find((item) => item.code === countryCode)?.label ?? countryCode;
+
+    if (demoMode) {
+      setMessage("Demo mode — showing sample GEO Rank data");
+      setAnalysisError(
+        "Live analysis is unavailable without API credentials. Your sample score remains available.",
+      );
+      return;
+    }
+
+    setAnalysisError("");
+    const prompt = `For users in ${country}, what are the leading ${industry} brands or services, and how does ${brandName} (${website}) compare? Include sources.`;
+    const analysisId = crypto.randomUUID();
+    const completed = await callScrape(prompt, analysisId);
+
+    if (completed) {
+      setSelectedAnalysisId(null);
+    } else {
+      setAnalysisError(
+        "GEO Rank analysis failed. Check the existing provider configuration and try again.",
+      );
+    }
+  }
+
+  function commitCompetitors() {
+    const competitorNames = normalizeCompetitorNames(
+      competitorDraft,
+      state.brand.brandName,
+    );
+
+    setState((prev) => {
+      const existingByName = new Map(
+        prev.competitors.map((competitor) => [
+          competitor.name.trim().toLowerCase(),
+          competitor,
+        ]),
+      );
+
+      return {
+        ...prev,
+        competitors: competitorNames.map((name) => {
+          const existing = existingByName.get(name.toLowerCase());
+          return existing
+            ? { ...existing, name }
+            : { name, aliases: [], websites: [] };
+        }),
+      };
+    });
   }
 
   /** Batch run all custom prompts across all active providers — fully parallel */
@@ -1708,12 +2037,12 @@ ${exampleJson}`,
             <div className="flex items-center gap-2 px-1 py-0.5">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-th-accent">
                 <span className="text-xs font-bold text-th-text-inverse">
-                  {(state.brand.brandName || "AE").slice(0, 2).toUpperCase()}
+                  GR
                 </span>
               </div>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-semibold text-th-text">
-                  {state.brand.brandName || "AEO Tracker"}
+                  GEO Rank
                 </div>
                 <div className="text-xs text-th-text-muted">Demo workspace</div>
               </div>
@@ -1726,19 +2055,17 @@ ${exampleJson}`,
               >
                 <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-th-accent">
                   <span className="text-xs font-bold text-th-text-inverse">
-                    {(state.brand.brandName || "AE").slice(0, 2).toUpperCase()}
+                    GR
                   </span>
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-semibold text-th-text">
-                    {state.brand.brandName || "AEO Tracker"}
+                    GEO Rank
                   </div>
                   {state.brand.websites.length > 0 && (
                     <div className="truncate text-xs text-th-text-muted">
-                      {state.brand.websites[0].replace(/^https?:\/\//, "")}
-                      {state.brand.websites.length > 1
-                        ? ` +${state.brand.websites.length - 1}`
-                        : ""}
+                      {state.brand.brandName ||
+                        state.brand.websites[0].replace(/^https?:\/\//, "")}
                     </div>
                   )}
                 </div>
@@ -1795,16 +2122,10 @@ ${exampleJson}`,
 
         {/* Nav */}
         <nav className="flex-1 overflow-y-auto px-2 py-2">
-          {tabs.map((tab) => {
+          {visibleTabs.map((tab) => {
             const active = activeTab === tab;
-            const isSettings = tab === "Project Settings";
             return (
               <div key={tab}>
-                {isSettings && (
-                  <div className="mb-1 px-2 text-xs font-medium uppercase tracking-wider text-th-text-muted">
-                    Setup
-                  </div>
-                )}
                 <button
                   title={tabMeta[tab].tooltip}
                   onClick={() => {
@@ -1832,24 +2153,14 @@ ${exampleJson}`,
                     {tabIcons[tab]}
                   </span>
                   {tabMeta[tab].title}
-                  {tab === "Automation" && unreadAlertCount > 0 && (
-                    <span className="ml-auto rounded-full bg-th-danger px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">
-                      {unreadAlertCount}
-                    </span>
-                  )}
                 </button>
-                {isSettings && (
-                  <div className="mb-1 mt-2 border-t border-th-border pt-2 px-2 text-xs font-medium uppercase tracking-wider text-th-text-muted">
-                    Pillars
-                  </div>
-                )}
               </div>
             );
           })}
         </nav>
 
         {/* Bright Data CTA */}
-        <div className="border-t border-th-border px-3 py-3">
+        <div className="hidden border-t border-th-border px-3 py-3">
           <a
             href="https://brightdata.com/?utm_source=geo-tracker-os"
             target="_blank"
@@ -1921,15 +2232,15 @@ ${exampleJson}`,
       </aside>
 
       {/* ── Main content ───────────────────────────────────── */}
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* Demo banner */}
         {demoMode && (
-          <div className="flex shrink-0 items-center justify-center gap-2 border-b border-th-border bg-th-accent-soft px-4 py-1.5 text-xs font-medium text-th-text-accent">
-            <span className="inline-block h-1.5 w-1.5 rounded-full bg-th-accent" />
-            <span>
-              {demoReason === "no-key"
-                ? "Sample data — add BRIGHT_DATA_KEY to your environment to track live AI engines"
-                : "Read-only demo — sample data, live API calls disabled"}
+          <div className="flex shrink-0 flex-wrap items-center justify-center gap-2 border-b border-th-border bg-th-accent-soft px-3 py-2 text-center text-xs text-th-text-accent">
+            <span className="rounded-full bg-th-accent px-2 py-0.5 font-semibold text-th-text-inverse">
+              Demo Data
+            </span>
+            <span className="font-medium">
+              Connect AI provider credentials to run live GEO Rank analyses.
             </span>
           </div>
         )}
@@ -1959,10 +2270,10 @@ ${exampleJson}`,
           <h1 className="mr-auto text-sm font-semibold text-th-text md:text-base">
             {tabMeta[activeTab].title}
           </h1>
-          <label className="hidden text-sm text-th-text-muted sm:inline">
+          <label className="hidden text-sm text-th-text-muted">
             Models
           </label>
-          <div className="flex items-center gap-1 overflow-x-auto">
+          <div className="hidden items-center gap-1 overflow-x-auto">
             {ALL_PROVIDERS.map((p) => {
               const active = state.activeProviders.includes(p);
               return (
@@ -2020,7 +2331,7 @@ ${exampleJson}`,
           </div>
 
           {/* Country / geo selector */}
-          <label className="hidden text-sm text-th-text-muted lg:inline">
+          <label className="hidden text-sm text-th-text-muted">
             Region
           </label>
           <select
@@ -2028,7 +2339,7 @@ ${exampleJson}`,
             onChange={(e) =>
               setState((prev) => ({ ...prev, country: e.target.value }))
             }
-            className="rounded-md border border-th-border bg-th-card-alt px-2 py-1 text-xs text-th-text-secondary hover:bg-th-card-hover"
+            className="hidden rounded-md border border-th-border bg-th-card-alt px-2 py-1 text-xs text-th-text-secondary hover:bg-th-card-hover"
             title="Country to run AI-visibility checks from (Bright Data geolocation)"
           >
             {COUNTRIES.map((c) => (
@@ -2056,45 +2367,693 @@ ${exampleJson}`,
 
         {/* Scrollable body */}
         <main className="flex-1 overflow-y-auto bg-th-bg px-3 py-3 md:px-5 md:py-4">
-          {/* KPI strip — overview (Visibility Analytics) only */}
+          {/* GEO Rank overview */}
           {activeTab === "Visibility Analytics" && (
-            <section className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-3 xl:grid-cols-6">
-              <KpiCard label="Total Runs" value={state.runs.length} />
-              <KpiCard
-                label="Avg Visibility"
-                value={
-                  state.runs.length > 0
-                    ? `${Math.round(state.runs.reduce((a, r) => a + (r.visibilityScore ?? 0), 0) / state.runs.length)}%`
-                    : "—"
-                }
-                delta={kpiVisibilityDelta}
-                small
-                onInfoClick={() => setShowScoreInfo(!showScoreInfo)}
-              />
-              <KpiCard
-                label="Brand Mentioned"
-                value={
-                  state.runs.filter((r) => (r.brandMentions?.length ?? 0) > 0)
-                    .length
-                }
-              />
-              <KpiCard label="Captured Sources" value={totalSources} />
-              <KpiCard label="Citation Opps" value={citationOpportunities} />
-              <KpiCard
-                label="Latest Run"
-                value={
-                  latestRun
-                    ? latestRun.createdAt.replace("T", " ").slice(0, 16)
-                    : "—"
-                }
-                small
-              />
+            <section className="mx-auto mb-4 max-w-6xl space-y-4">
+              <div className="rounded-2xl border border-th-border bg-th-card p-6 shadow-sm md:p-8">
+                <div className="grid items-center gap-8 lg:grid-cols-[minmax(0,1fr)_280px]">
+                  <div>
+                    <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-th-text-accent">
+                      GEO Rank Score
+                    </div>
+                    <h2 className="text-2xl font-semibold tracking-tight text-th-text md:text-3xl">
+                      {state.brand.brandName
+                        ? `${state.brand.brandName}'s AI visibility`
+                        : "Your AI visibility at a glance"}
+                    </h2>
+                    <p className="mt-3 max-w-xl text-sm leading-6 text-th-text-secondary">
+                      Your score summarizes how prominently your brand appears
+                      across the AI answers already tracked by GEO Rank.
+                    </p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <p className="text-xs font-medium text-th-text-muted">
+                        {viewingHistoricalAnalysis && selectedHistory
+                          ? `Viewing analysis from ${formatAnalysisDate(selectedHistory.timestamp)}`
+                          : currentAnalysis.isLegacy
+                            ? "Available analysis data"
+                            : "Latest analysis"}
+                        : {geoRank.completedRuns} completed responses
+                      </p>
+                      {viewingHistoricalAnalysis && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedAnalysisId(null)}
+                          className="rounded-md border border-th-border px-2 py-1 text-xs font-medium text-th-text-accent transition-colors hover:bg-th-card-hover"
+                        >
+                          Back to Latest
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => setShowScoreInfo(!showScoreInfo)}
+                      className="mt-5 text-sm font-medium text-th-text-accent hover:underline"
+                    >
+                      How the score works
+                    </button>
+                  </div>
+                  <div className="mx-auto flex flex-col items-center">
+                    <div
+                      className="flex h-56 w-56 items-center justify-center rounded-full p-3"
+                      style={{
+                        background: `conic-gradient(var(--th-accent) ${geoRank.score * 3.6}deg, var(--th-score-ring-bg) 0deg)`,
+                      }}
+                    >
+                      <div className="flex h-full w-full flex-col items-center justify-center rounded-full bg-th-card">
+                        <span className="text-6xl font-semibold tracking-tighter text-th-text">
+                          {geoRank.score}
+                        </span>
+                        <span className="mt-1 text-sm font-medium text-th-text-muted">
+                          out of 100
+                        </span>
+                      </div>
+                    </div>
+                    <p className="mt-3 max-w-[240px] text-center text-xs leading-relaxed text-th-text-muted">
+                      Based on visibility, citations, provider coverage and
+                      consistency.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <KpiCard
+                  label="AI Visibility"
+                  value={`${geoRank.aiVisibility}%`}
+                />
+                <KpiCard
+                  label="Citation Rate"
+                  value={`${geoRank.citationRate}%`}
+                />
+                <KpiCard
+                  label="Provider Coverage"
+                  value={`${geoRank.providerCoverage}%`}
+                />
+                <KpiCard
+                  label="Mention Consistency"
+                  value={`${geoRank.mentionConsistency}%`}
+                />
+              </div>
+
+              <div className="rounded-xl border border-th-border bg-th-card p-4 shadow-sm">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <h3 className="text-sm font-semibold text-th-text">
+                    Why this score?
+                  </h3>
+                  <span className="rounded-full bg-th-accent-soft px-2.5 py-1 text-xs font-medium text-th-text-accent">
+                    {geoRank.interpretation}
+                  </span>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                  <ScoreExplanationItem
+                    label="Brand mentioned"
+                    value={`${geoRank.mentioningRuns} of ${geoRank.completedRuns} AI responses`}
+                  />
+                  <ScoreExplanationItem
+                    label="Website cited"
+                    value={`${geoRank.citingRuns} of ${geoRank.completedRuns} AI responses`}
+                  />
+                  <ScoreExplanationItem
+                    label="Provider coverage"
+                    value={`${geoRank.mentioningProviders} of ${geoRank.completedProviders} AI providers`}
+                  />
+                  <ScoreExplanationItem
+                    label="Prompt consistency"
+                    value={`${geoRank.mentioningDistinctPrompts} of ${geoRank.totalDistinctPrompts} prompts`}
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-th-border bg-th-card p-4 shadow-sm">
+                <div className="mb-3">
+                  <h3 className="text-sm font-semibold text-th-text">
+                    Current vs Previous
+                  </h3>
+                  <p className="mt-1 text-xs text-th-text-muted">
+                    The two most recent completed analysis batches.
+                  </p>
+                </div>
+
+                {latestComparison ? (
+                  <>
+                    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                      <ComparisonMetric
+                        label="GEO Rank"
+                        previous={latestComparison.previous.score}
+                        current={latestComparison.current.score}
+                        difference={latestComparison.differences.score}
+                      />
+                      <ComparisonMetric
+                        label="AI Visibility"
+                        previous={latestComparison.previous.aiVisibility}
+                        current={latestComparison.current.aiVisibility}
+                        difference={latestComparison.differences.aiVisibility}
+                        suffix="%"
+                        differenceSuffix=" pts"
+                      />
+                      <ComparisonMetric
+                        label="Citation Rate"
+                        previous={latestComparison.previous.citationRate}
+                        current={latestComparison.current.citationRate}
+                        difference={latestComparison.differences.citationRate}
+                        suffix="%"
+                        differenceSuffix=" pts"
+                      />
+                      <ComparisonMetric
+                        label="Provider Coverage"
+                        previous={latestComparison.previous.providerCoverage}
+                        current={latestComparison.current.providerCoverage}
+                        difference={
+                          latestComparison.differences.providerCoverage
+                        }
+                        suffix="%"
+                        differenceSuffix=" pts"
+                      />
+                      <ComparisonMetric
+                        label="Mention Consistency"
+                        previous={latestComparison.previous.mentionConsistency}
+                        current={latestComparison.current.mentionConsistency}
+                        difference={
+                          latestComparison.differences.mentionConsistency
+                        }
+                        suffix="%"
+                        differenceSuffix=" pts"
+                      />
+                      <ComparisonMetric
+                        label="Completed Responses"
+                        previous={latestComparison.previous.completedResponses}
+                        current={latestComparison.current.completedResponses}
+                        difference={
+                          latestComparison.differences.completedResponses
+                        }
+                      />
+                    </div>
+                    <p className="mt-3 text-xs text-th-text-muted">
+                      GEO Rank changed by{" "}
+                      {latestComparison.differences.score > 0 ? "+" : ""}
+                      {latestComparison.differences.score} points since the
+                      previous analysis.
+                    </p>
+                  </>
+                ) : (
+                  <p className="py-4 text-sm text-th-text-muted">
+                    Run at least two analyses to compare changes.
+                  </p>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-th-border bg-th-card p-4 shadow-sm">
+                <div className="mb-4">
+                  <h3 className="text-sm font-semibold text-th-text">
+                    GEO Rank History
+                  </h3>
+                  <p className="mt-1 text-xs text-th-text-muted">
+                    Scores from persisted, identified analysis batches.
+                  </p>
+                </div>
+
+                {validAnalysisHistory.length === 0 ? (
+                  <p className="py-6 text-center text-sm text-th-text-muted">
+                    Run a new analysis to start GEO Rank history.
+                  </p>
+                ) : (
+                  <>
+                    <div className="mb-5 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                      <HistoryMetric
+                        label="Current score"
+                        value={currentHistory?.score ?? "—"}
+                      />
+                      <HistoryMetric
+                        label="Previous score"
+                        value={previousHistory?.score ?? "—"}
+                      />
+                      <HistoryMetric
+                        label="Change"
+                        value={
+                          historyChange === null
+                            ? "No previous analysis"
+                            : `${historyChange > 0 ? "+" : ""}${historyChange} points`
+                        }
+                      />
+                      <HistoryMetric
+                        label="Completed analyses"
+                        value={completedAnalysisCount}
+                      />
+                    </div>
+
+                    {historyChartData.length > 0 && (
+                      <div className="mb-5 h-60 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart
+                            data={historyChartData}
+                            margin={{ top: 8, right: 12, left: -18, bottom: 0 }}
+                          >
+                            <CartesianGrid
+                              stroke="var(--th-chart-grid)"
+                              vertical={false}
+                            />
+                            <XAxis
+                              dataKey="date"
+                              tick={{
+                                fill: "var(--th-chart-axis)",
+                                fontSize: 11,
+                              }}
+                              tickLine={false}
+                              axisLine={false}
+                            />
+                            <YAxis
+                              domain={[0, 100]}
+                              ticks={[0, 20, 40, 60, 80, 100]}
+                              tick={{
+                                fill: "var(--th-chart-axis)",
+                                fontSize: 11,
+                              }}
+                              tickLine={false}
+                              axisLine={false}
+                            />
+                            <Tooltip
+                              contentStyle={{
+                                background: "var(--th-card)",
+                                border: "1px solid var(--th-border)",
+                                borderRadius: "8px",
+                                color: "var(--th-text)",
+                              }}
+                            />
+                            <Line
+                              type="monotone"
+                              dataKey="score"
+                              name="GEO Rank"
+                              stroke="var(--th-chart-line)"
+                              strokeWidth={2}
+                              dot={{
+                                r: 4,
+                                fill: "var(--th-chart-dot)",
+                                strokeWidth: 0,
+                              }}
+                              activeDot={{ r: 5 }}
+                            />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+
+                    <div className="divide-y divide-th-border rounded-lg border border-th-border">
+                      {validAnalysisHistory
+                        .slice(0, 10)
+                        .map((analysis, index) => {
+                        const isLatest = index === 0;
+                        const isActive = selectedHistory
+                          ? selectedHistory.analysisId === analysis.analysisId
+                          : isLatest;
+
+                        return (
+                          <button
+                            key={analysis.analysisId}
+                            type="button"
+                            onClick={() =>
+                              setSelectedAnalysisId(
+                                isLatest ? null : analysis.analysisId,
+                              )
+                            }
+                            className={`grid w-full grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-th-card-hover ${
+                              isActive ? "bg-th-accent-soft" : "bg-th-card"
+                            }`}
+                          >
+                            <div className="min-w-0 text-sm text-th-text-secondary">
+                              {formatAnalysisDate(analysis.timestamp)}
+                              {isLatest && (
+                                <span className="ml-2 rounded-full bg-th-accent px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-th-text-inverse">
+                                  Latest
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-sm font-semibold text-th-text">
+                              {analysis.score}
+                            </div>
+                            <div className="w-24 text-right text-xs text-th-text-muted">
+                              {analysis.completedResponses} response
+                              {analysis.completedResponses === 1 ? "" : "s"}
+                            </div>
+                          </button>
+                        );
+                        })}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-th-border bg-th-card p-4 shadow-sm">
+                <div className="mb-3">
+                  <h3 className="text-sm font-semibold text-th-text">
+                    AI Share of Voice
+                  </h3>
+                  <p className="mt-1 text-xs text-th-text-muted">
+                    Brand appearances across completed AI responses.
+                  </p>
+                </div>
+                {geoRank.completedRuns === 0 ? (
+                  <p className="py-3 text-sm text-th-text-muted">
+                    Run an analysis to see AI Share of Voice.
+                  </p>
+                ) : shareOfVoice.length === 0 ? (
+                  <p className="py-3 text-sm text-th-text-muted">
+                    Add a brand to see Share of Voice.
+                  </p>
+                ) : (
+                  <div className="divide-y divide-th-border rounded-lg border border-th-border">
+                    {shareOfVoice.map((entry) => (
+                      <div
+                        key={`${entry.isTarget ? "target" : "competitor"}-${entry.name}`}
+                        className={`grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 px-3 py-2.5 ${
+                          entry.isTarget ? "bg-th-accent-soft" : "bg-th-card"
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <span className="break-words text-sm font-medium text-th-text">
+                            {entry.name}
+                          </span>
+                          {entry.isTarget && (
+                            <span className="ml-2 rounded-full bg-th-accent px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-th-text-inverse">
+                              Target
+                            </span>
+                          )}
+                        </div>
+                        <div className="whitespace-nowrap text-xs text-th-text-secondary">
+                          {entry.mentionCount} mention
+                          {entry.mentionCount === 1 ? "" : "s"}
+                        </div>
+                        <div className="w-16 text-right text-sm font-semibold text-th-text">
+                          {entry.shareOfVoice.toFixed(1)}%
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-th-border bg-th-card shadow-sm">
+                <div className="flex flex-col gap-3 border-b border-th-border p-4 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold text-th-text">
+                      Query Results
+                    </h3>
+                    <p className="mt-1 text-xs text-th-text-muted">
+                      Completed AI responses used in your GEO Rank score.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <label className="text-xs font-medium text-th-text-muted">
+                      Provider
+                      <select
+                        value={queryProviderFilter}
+                        onChange={(event) =>
+                          setQueryProviderFilter(
+                            event.target.value as Provider | "all",
+                          )
+                        }
+                        className="bd-input mt-1 block rounded-md px-2.5 py-1.5 text-xs text-th-text-secondary"
+                      >
+                        <option value="all">All</option>
+                        {queryResultProviders.map((provider) => (
+                          <option key={provider} value={provider}>
+                            {PROVIDER_LABELS[provider]}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-xs font-medium text-th-text-muted">
+                      Visibility
+                      <select
+                        value={queryVisibilityFilter}
+                        onChange={(event) =>
+                          setQueryVisibilityFilter(
+                            event.target.value as QueryVisibilityFilter,
+                          )
+                        }
+                        className="bd-input mt-1 block rounded-md px-2.5 py-1.5 text-xs text-th-text-secondary"
+                      >
+                        <option value="all">All</option>
+                        <option value="mentioned">Mentioned</option>
+                        <option value="not-mentioned">Not Mentioned</option>
+                        <option value="cited">Cited</option>
+                        <option value="not-cited">Not Cited</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+
+                {queryResults.length === 0 ? (
+                  <p className="p-6 text-center text-sm text-th-text-muted">
+                    Run an analysis to see query-level results.
+                  </p>
+                ) : filteredQueryResults.length === 0 ? (
+                  <p className="p-6 text-center text-sm text-th-text-muted">
+                    No query results match these filters.
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="min-w-[1050px] w-full border-collapse text-left text-sm">
+                      <thead className="bg-th-card-alt text-xs uppercase tracking-wider text-th-text-muted">
+                        <tr>
+                          <th className="px-4 py-3 font-medium">Query</th>
+                          <th className="px-4 py-3 font-medium">Provider</th>
+                          <th className="px-4 py-3 font-medium">
+                            Brand Mention
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Website Citation
+                          </th>
+                          <th className="px-4 py-3 font-medium">
+                            Brands Found
+                          </th>
+                          <th className="px-4 py-3 font-medium">Result</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-th-border">
+                        {filteredQueryResults.map(
+                          ({ run, mentioned, cited, brandsFound }, index) => (
+                            <tr
+                              key={`${run.createdAt}-${run.provider}-${index}`}
+                              className="align-top hover:bg-th-card-hover"
+                            >
+                              <td className="max-w-[280px] whitespace-normal break-words px-4 py-3 font-medium text-th-text">
+                                {run.prompt}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3 text-th-text-secondary">
+                                {PROVIDER_LABELS[run.provider]}
+                              </td>
+                              <td className="px-4 py-3">
+                                <ResultBadge value={mentioned} />
+                              </td>
+                              <td className="px-4 py-3">
+                                <ResultBadge value={cited} />
+                              </td>
+                              <td className="max-w-[220px] whitespace-normal break-words px-4 py-3 text-th-text-secondary">
+                                {brandsFound.length > 0
+                                  ? brandsFound
+                                      .map((brand) => brand.name)
+                                      .join(", ")
+                                  : "—"}
+                              </td>
+                              <td className="max-w-[420px] whitespace-normal break-words px-4 py-3 leading-relaxed text-th-text-secondary">
+                                {createAnswerPreview(run.answer)}
+                              </td>
+                            </tr>
+                          ),
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-th-border bg-th-card p-5 shadow-sm md:p-6">
+                <div className="mb-5">
+                  <h3 className="text-base font-semibold text-th-text">
+                    Project details
+                  </h3>
+                  <p className="mt-1 text-sm text-th-text-muted">
+                    Tell GEO Rank which brand and market to measure.
+                  </p>
+                </div>
+                {!hasCompletedRealAnalysis && (
+                  <div className="mb-5 rounded-xl border border-th-border bg-th-card-alt p-4">
+                    <p className="text-sm font-medium text-th-text">
+                      Measure how often your brand appears and gets cited across
+                      AI search results.
+                    </p>
+                    <ol className="mt-3 grid gap-2 text-xs text-th-text-secondary sm:grid-cols-3">
+                      <li>1. Enter your website and brand</li>
+                      <li>2. Add optional competitors</li>
+                      <li>3. Run GEO Rank analysis</li>
+                    </ol>
+                  </div>
+                )}
+                <div className="grid gap-4 md:grid-cols-2">
+                  <DashboardField
+                    label="Website"
+                    placeholder="example.com"
+                    value={state.brand.websites[0] ?? ""}
+                    error={analysisFieldErrors.website}
+                    onBlur={(website) =>
+                      setState((prev) => ({
+                        ...prev,
+                        brand: {
+                          ...prev.brand,
+                          websites: [
+                            website.trim(),
+                            ...prev.brand.websites.slice(1),
+                          ],
+                        },
+                      }))
+                    }
+                    onChange={(website) => {
+                      setAnalysisFieldErrors((prev) => ({
+                        ...prev,
+                        website: undefined,
+                      }));
+                      setState((prev) => ({
+                        ...prev,
+                        brand: {
+                          ...prev.brand,
+                          websites: [website, ...prev.brand.websites.slice(1)],
+                        },
+                      }));
+                    }}
+                  />
+                  <DashboardField
+                    label="Brand"
+                    placeholder="Your brand name"
+                    value={state.brand.brandName}
+                    error={analysisFieldErrors.brand}
+                    onBlur={(brandName) =>
+                      setState((prev) => ({
+                        ...prev,
+                        brand: { ...prev.brand, brandName: brandName.trim() },
+                      }))
+                    }
+                    onChange={(brandName) => {
+                      setAnalysisFieldErrors((prev) => ({
+                        ...prev,
+                        brand: undefined,
+                      }));
+                      setState((prev) => ({
+                        ...prev,
+                        brand: { ...prev.brand, brandName },
+                      }));
+                    }}
+                  />
+                  <DashboardField
+                    label="Industry"
+                    placeholder="e.g. B2B SaaS"
+                    value={state.brand.industry}
+                    error={analysisFieldErrors.industry}
+                    onBlur={(industry) =>
+                      setState((prev) => ({
+                        ...prev,
+                        brand: { ...prev.brand, industry: industry.trim() },
+                      }))
+                    }
+                    onChange={(industry) => {
+                      setAnalysisFieldErrors((prev) => ({
+                        ...prev,
+                        industry: undefined,
+                      }));
+                      setState((prev) => ({
+                        ...prev,
+                        brand: { ...prev.brand, industry },
+                      }));
+                    }}
+                  />
+                  <div>
+                    <label
+                      htmlFor="geo-rank-country"
+                      className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-th-text-muted"
+                    >
+                      Country
+                    </label>
+                    <select
+                      id="geo-rank-country"
+                      value={state.country}
+                      aria-invalid={Boolean(analysisFieldErrors.country)}
+                      aria-describedby={
+                        analysisFieldErrors.country
+                          ? "geo-rank-country-error"
+                          : undefined
+                      }
+                      onChange={(event) => {
+                        setAnalysisFieldErrors((prev) => ({
+                          ...prev,
+                          country: undefined,
+                        }));
+                        setState((prev) => ({
+                          ...prev,
+                          country: event.target.value,
+                        }));
+                      }}
+                      className="bd-input w-full rounded-lg p-2.5 text-sm"
+                    >
+                      {COUNTRIES.map((country) => (
+                        <option key={country.code} value={country.code}>
+                          {country.label}
+                        </option>
+                      ))}
+                    </select>
+                    {analysisFieldErrors.country && (
+                      <p
+                        id="geo-rank-country-error"
+                        className="mt-1 text-xs text-th-danger"
+                      >
+                        {analysisFieldErrors.country}
+                      </p>
+                    )}
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-th-text-muted">
+                      Competitors
+                    </label>
+                    <input
+                      value={competitorDraft}
+                      onFocus={() => setCompetitorFieldFocused(true)}
+                      onBlur={() => {
+                        setCompetitorFieldFocused(false);
+                        commitCompetitors();
+                      }}
+                      onChange={(event) =>
+                        setCompetitorDraft(event.target.value)
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.currentTarget.blur();
+                      }}
+                      placeholder="DentGroup, Clinic A, Smile Center"
+                      className="bd-input w-full rounded-lg p-2.5 text-sm"
+                    />
+                    <p className="mt-1 text-xs text-th-text-muted">
+                      Optional · separate competitor brand names with commas.
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-5 flex flex-col items-start gap-2 border-t border-th-border pt-5 sm:flex-row sm:items-center">
+                  <button
+                    type="button"
+                    onClick={analyzeGeoRank}
+                    disabled={busy}
+                    className="bd-btn-primary rounded-lg px-5 py-2.5 text-sm disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {busy ? "Analyzing AI visibility…" : "Analyze GEO Rank"}
+                  </button>
+                  {analysisError && (
+                    <p className="text-xs leading-relaxed text-th-danger">
+                      {analysisError}
+                    </p>
+                  )}
+                </div>
+              </div>
             </section>
           )}
 
           {/* ── Movers strip — overview only ── */}
           {activeTab === "Visibility Analytics" && movers.length > 0 && (
-            <section className="mb-4 rounded-xl border border-th-border bg-th-card p-4">
+            <section className="hidden mb-4 rounded-xl border border-th-border bg-th-card p-4">
               <div className="mb-3 flex items-center gap-2">
                 <span className="text-base">📊</span>
                 <h3 className="text-sm font-semibold text-th-text">
@@ -2148,7 +3107,7 @@ ${exampleJson}`,
             <section className="mb-4 rounded-xl border border-th-border bg-th-card p-4">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-base font-semibold text-th-text">
-                  How Visibility Scoring Works
+                  How GEO Rank Scoring Works
                 </h3>
                 <button
                   onClick={() => setShowScoreInfo(false)}
@@ -2158,61 +3117,51 @@ ${exampleJson}`,
                 </button>
               </div>
               <p className="text-sm text-th-text-secondary mb-3">
-                The visibility score (0–100) measures how prominently your brand
-                appears in AI model responses. Each factor contributes points:
+                GEO Rank is a deterministic 0–100 score calculated from
+                completed analysis runs. Each factor contributes a fixed weight:
               </p>
-              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                 <ScoreFactorCard
                   emoji="🔍"
-                  label="Brand Mentioned"
-                  points="+30"
-                  desc="Your brand name or alias appears in the response"
-                />
-                <ScoreFactorCard
-                  emoji="🏆"
-                  label="Prominent Position"
-                  points="+20"
-                  desc="Brand is mentioned in the first 200 characters"
-                />
-                <ScoreFactorCard
-                  emoji="🔁"
-                  label="Multiple Mentions"
-                  points="+8 to +15"
-                  desc="Brand appears 2+ times (8pts) or 3+ times (15pts)"
+                  label="AI Visibility"
+                  points="40%"
+                  desc="Completed responses where the brand is mentioned"
                 />
                 <ScoreFactorCard
                   emoji="🔗"
-                  label="Website Cited"
-                  points="+20"
-                  desc="Your website URL appears in the cited sources"
+                  label="Citation Rate"
+                  points="30%"
+                  desc="Completed responses that cite the target website domain"
                 />
                 <ScoreFactorCard
-                  emoji="👍"
-                  label="Positive Sentiment"
-                  points="+15"
-                  desc="Response uses positive language about your brand"
+                  emoji="◫"
+                  label="Provider Coverage"
+                  points="20%"
+                  desc="Configured providers that mention the brand at least once"
                 />
                 <ScoreFactorCard
-                  emoji="😐"
-                  label="Neutral Sentiment"
-                  points="+5"
-                  desc="Response mentions brand in a neutral context"
+                  emoji="↻"
+                  label="Mention Consistency"
+                  points="10%"
+                  desc="Distinct completed prompts where the brand appears"
                 />
               </div>
             </section>
           )}
 
           {/* Active tab panel */}
-          <section className="rounded-xl border border-th-border bg-th-card p-5 shadow-sm">
-            {renderActiveTab()}
-          </section>
+          {activeTab !== "Visibility Analytics" && (
+            <section className="rounded-xl border border-th-border bg-th-card p-5 shadow-sm">
+              {renderActiveTab()}
+            </section>
+          )}
           {/* SRO Analysis stays mounted to preserve in-flight state */}
           <div className={activeTab === "SRO Analysis" ? "" : "hidden"}>
             <section className="rounded-xl border border-th-border bg-th-card p-5 shadow-sm">
               <SROAnalysisTab demoMode={demoMode} />
             </section>
           </div>
-          <section className="mt-3 rounded-lg border border-th-border bg-th-card px-4 py-3">
+          <section className={`mt-3 rounded-lg border border-th-border bg-th-card px-4 py-3 ${activeTab === "Visibility Analytics" ? "hidden" : ""}`}>
             <div className="text-xs uppercase tracking-wider font-medium text-th-text-muted">
               What this tab does
             </div>
@@ -2223,6 +3172,142 @@ ${exampleJson}`,
         </main>
       </div>
     </div>
+  );
+}
+
+function DashboardField({
+  label,
+  placeholder,
+  value,
+  error,
+  onBlur,
+  onChange,
+}: {
+  label: string;
+  placeholder: string;
+  value: string;
+  error?: string;
+  onBlur?: (value: string) => void;
+  onChange: (value: string) => void;
+}) {
+  const inputId = `geo-rank-${label.toLowerCase().replace(/\s+/g, "-")}`;
+  const errorId = `${inputId}-error`;
+
+  return (
+    <div>
+      <label
+        htmlFor={inputId}
+        className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-th-text-muted"
+      >
+        {label}
+      </label>
+      <input
+        id={inputId}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onBlur={(event) => onBlur?.(event.target.value)}
+        aria-invalid={Boolean(error)}
+        aria-describedby={error ? errorId : undefined}
+        placeholder={placeholder}
+        className="bd-input w-full rounded-lg p-2.5 text-sm"
+      />
+      {error && (
+        <p id={errorId} className="mt-1 text-xs text-th-danger">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ScoreExplanationItem({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-lg border border-th-border bg-th-card-alt px-3 py-2.5">
+      <div className="text-xs font-medium text-th-text-muted">{label}</div>
+      <div className="mt-1 text-sm font-semibold text-th-text">{value}</div>
+    </div>
+  );
+}
+
+function HistoryMetric({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | number;
+}) {
+  return (
+    <div className="rounded-lg border border-th-border bg-th-card-alt px-3 py-2.5">
+      <div className="text-xs font-medium text-th-text-muted">{label}</div>
+      <div className="mt-1 text-sm font-semibold text-th-text">{value}</div>
+    </div>
+  );
+}
+
+function ComparisonMetric({
+  label,
+  previous,
+  current,
+  difference,
+  suffix = "",
+  differenceSuffix = "",
+}: {
+  label: string;
+  previous: number;
+  current: number;
+  difference: number;
+  suffix?: string;
+  differenceSuffix?: string;
+}) {
+  const differenceClass =
+    difference > 0
+      ? "text-th-success"
+      : difference < 0
+        ? "text-th-danger"
+        : "text-th-text-muted";
+
+  return (
+    <div className="rounded-lg border border-th-border bg-th-card-alt px-3 py-2.5">
+      <div className="text-xs font-medium text-th-text-muted">{label}</div>
+      <div className="mt-1 flex flex-wrap items-baseline gap-2">
+        <span className="text-sm text-th-text-secondary">
+          {previous}
+          {suffix}
+        </span>
+        <span aria-hidden="true" className="text-xs text-th-text-muted">
+          →
+        </span>
+        <span className="text-sm font-semibold text-th-text">
+          {current}
+          {suffix}
+        </span>
+        <span className={`ml-auto text-xs font-semibold ${differenceClass}`}>
+          {difference > 0 ? "+" : ""}
+          {difference}
+          {differenceSuffix}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ResultBadge({ value }: { value: boolean }) {
+  return (
+    <span
+      className={`inline-flex rounded-full px-2 py-1 text-xs font-semibold ${
+        value
+          ? "bg-th-success-soft text-th-success"
+          : "bg-th-card-alt text-th-text-muted"
+      }`}
+    >
+      {value ? "Yes" : "No"}
+    </span>
   );
 }
 

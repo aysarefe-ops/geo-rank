@@ -6,6 +6,8 @@ export type Provider =
   | "google_ai";
 
 export type ScrapeRun = {
+  /** Groups successful provider results created by one dashboard analysis. */
+  analysisId?: string;
   provider: Provider;
   prompt: string;
   answer: string;

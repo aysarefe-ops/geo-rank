@@ -15,8 +15,9 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "GEO/AEO Tracker",
-  description: "BYOK AEO/GEO intelligence dashboard with local-first persistence",
+  title: "GEO Rank — AI Search Visibility",
+  description:
+    "Measure brand visibility, citations, provider coverage, and Share of Voice across AI search results.",
 };
 
 /** Inline script to apply theme before first paint — prevents flash */
